@@ -10,12 +10,12 @@ dependencies = [
     "fastapi>=0.128.0",
     "groq>=1.0.0",
     "passlib[bcrypt]>=1.7.4",
-    "psycopg[binary]>=3.3.2",
     "pydantic-settings>=2.12.0",
     "pypdf2>=3.0.1",
     "python-dotenv>=1.2.1",
     "python-jose>=3.5.0",
     "python-multipart>=0.0.21",
+    "ruff>=0.14.13",
     "sqlalchemy>=2.0.45",
     "uvicorn>=0.40.0",
 ]
