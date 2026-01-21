@@ -6,21 +6,24 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-SECRET_KEY = os.getenv("SECRET_KEY")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-CHROMA_DB_PATH = os.getenv("CHROMA_DB_PATH", "./chroma_db")
+class Settings:
+    database_url: str = os.getenv("DATABASE_URL", "sqlite:///./pdf_rag.db")
+    secret_key: str = os.getenv("SECRET_KEY", "")
+    algorithm: str = os.getenv("ALGORITHM", "HS256")
+    access_token_expire_minutes: int = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "1440"))
+    groq_api_key: str = os.getenv("GROQ_API_KEY", "")
+    chroma_db_path: str = os.getenv("CHROMA_DB_PATH", "./chroma_db")
 
-if not DATABASE_URL:
-    raise ValueError("DATABASE_URL environment variable not set")
-if not SECRET_KEY:
-    raise ValueError("SECRET_KEY environment variable not set")
-if not GROQ_API_KEY:
-    raise ValueError("GROQ_API_KEY environment variable not set")
+settings = Settings()
+
+if not settings.secret_key:
+    raise ValueError("SECRET_KEY not set in .env")
+if not settings.groq_api_key:
+    raise ValueError("GROQ_API_KEY not set in .env")
 
 engine = create_engine(
-    DATABASE_URL,
-    pool_pre_ping=True,
+    settings.database_url,
+    connect_args={"check_same_thread": False} if "sqlite" in settings.database_url else {},
     echo=True,
 )
 
