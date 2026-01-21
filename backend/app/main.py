@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.database import init_db, test_connection
-
+from app import models
 app = FastAPI(
     title="PDF RAG API",
     description="Upload PDFs and query them with AI",
