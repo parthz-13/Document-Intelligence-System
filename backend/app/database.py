@@ -6,13 +6,17 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
 class Settings:
     database_url: str = os.getenv("DATABASE_URL", "sqlite:///./pdf_rag.db")
     secret_key: str = os.getenv("SECRET_KEY", "")
     algorithm: str = os.getenv("ALGORITHM", "HS256")
-    access_token_expire_minutes: int = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "1440"))
+    access_token_expire_minutes: int = int(
+        os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "1440")
+    )
     groq_api_key: str = os.getenv("GROQ_API_KEY", "")
     chroma_db_path: str = os.getenv("CHROMA_DB_PATH", "./chroma_db")
+
 
 settings = Settings()
 
@@ -23,7 +27,9 @@ if not settings.groq_api_key:
 
 engine = create_engine(
     settings.database_url,
-    connect_args={"check_same_thread": False} if "sqlite" in settings.database_url else {},
+    connect_args={"check_same_thread": False}
+    if "sqlite" in settings.database_url
+    else {},
     echo=True,
 )
 
@@ -47,7 +53,7 @@ def init_db():
 
 def test_connection():
     try:
-        with engine.connect() as connection:
+        with engine.connect():
             print("Database connection successful")
             return True
     except Exception as e:
