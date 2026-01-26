@@ -1,6 +1,5 @@
 # Database files
 *.db
-pdf_rag.db
 
 # Vector database
 chroma_db/
