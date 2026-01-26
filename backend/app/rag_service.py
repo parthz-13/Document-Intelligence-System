@@ -150,7 +150,7 @@ def query_document(
 
     print(f"Found {len(documents)} potential chunks")
 
-    SIMILARITY_THRESHOLD = 1.0
+    SIMILARITY_THRESHOLD = 1.63
 
     relevant_chunks: List[str] = []
     best_distance = float("inf")
