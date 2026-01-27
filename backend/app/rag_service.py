@@ -118,35 +118,74 @@ def query_document(
     user_id: int,
     n_results: int = 5
 ) -> Dict[str, Any]:
-    print(f"\nQuerying document {document_id}: {question}")
+    print(f"QUERY DEBUG")
+    print(f"Document ID: {document_id}")
+    print(f"Question: {question}")
     
     doc_id = str(document_id)
     
     summary_keywords = [
         "summary", "summarize", "summarise", "overview", "about",
         "what is this", "what's this", "tell me about", "main points",
-        "key points", "gist", "brief"
+        "key points", "gist", "brief", "describe this", "content"
     ]
     
     is_summary_question = any(keyword in question.lower() for keyword in summary_keywords)
     
+    identity_keywords = [
+        "who is", "who's", "tell me about", "information about",
+        "details about", "background of", "describe"
+    ]
+    
+    is_identity_question = any(keyword in question.lower() for keyword in identity_keywords)
+    
+    try:
+        doc_chunks = collection.get(
+            where={"doc_id": doc_id}
+        )
+        total_chunks = len(doc_chunks.get("ids", []))
+        print(f"\nDocument has {total_chunks} chunks in ChromaDB")
+        
+        if total_chunks == 0:
+            return {
+                "answer": "This document has no content. Please re-upload it.",
+                "source": "error",
+                "chunks_used": 0
+            }
+            
+    except Exception as e:
+        print(f"Error accessing ChromaDB: {e}")
+        return {
+            "answer": "Failed to access document storage. Please try again.",
+            "source": "error",
+            "chunks_used": 0
+        }
+    
     if is_summary_question:
-        print("Detected SUMMARY question - retrieving more chunks")
-        n_results = 10  
-        SIMILARITY_THRESHOLD = 2.0  
+        print("Detected SUMMARY question")
+        n_results = min(10, total_chunks)
+        SIMILARITY_THRESHOLD = 2.0
+        
+    elif is_identity_question:
+        print("Detected IDENTITY question")
+        n_results = min(10, total_chunks)
+        SIMILARITY_THRESHOLD = 2.0
+        
     else:
-        SIMILARITY_THRESHOLD = 1.63  
-
+        print("Specific question")
+        SIMILARITY_THRESHOLD = 1.63
+    
     try:
         results = collection.query(
             query_texts=[question],
             n_results=n_results,
             where={"doc_id": doc_id}
         )
+        print(f"Query returned {len(results.get('documents', [[]])[0])} results")
     except Exception as e:
         print(f"ChromaDB query failed: {e}")
         return {
-            "answer": "Failed to search the document. Please try again.",
+            "answer": "Search failed. Please try again.",
             "source": "error",
             "chunks_used": 0
         }
@@ -161,12 +200,49 @@ def query_document(
         documents = []
         distances = []
     
-    print(f"Found {len(documents)} chunks")
+    if is_identity_question:
+        import re
+        
+        patterns = [
+            r"who (?:is|'s) ([A-Z][a-z]+(?: [A-Z][a-z]+)*)",
+            r"about ([A-Z][a-z]+(?: [A-Z][a-z]+)*)",
+            r"tell me about ([A-Z][a-z]+(?: [A-Z][a-z]+)*)",
+        ]
+        
+        extracted_name = None
+        for pattern in patterns:
+            match = re.search(pattern, question)
+            if match:
+                extracted_name = match.group(1)
+                print(f"Extracted name from question: '{extracted_name}'")
+                break
+        
+        if extracted_name:
+            print(f"Searching for mentions of '{extracted_name}' in document...")
+            
+            name_chunks = []
+            for doc in documents:
+                if extracted_name.lower() in doc.lower():
+                    name_chunks.append(doc)
+                    print(f"Found in chunk: {doc[:80]}...")
+            
+            if name_chunks:
+                relevant_chunks = name_chunks
+                best_distance = 0.0  
+                print(f"Using {len(relevant_chunks)} chunks mentioning '{extracted_name}'")
+            else:
+                print(f"Name '{extracted_name}' not found in document")
+                relevant_chunks = []
+                best_distance = None
+        else:
+            relevant_chunks = [doc for doc, dist in zip(documents, distances) if dist < SIMILARITY_THRESHOLD]
+            best_distance = min(distances) if distances else None
     
-    if is_summary_question:
-        relevant_chunks = documents[:10] 
+    elif is_summary_question:
+        relevant_chunks = documents[:10]
         best_distance = min(distances) if distances else None
-        print(f"  → Using {len(relevant_chunks)} chunks for summary (no distance filter)")
+        print(f"  → Summary mode: Using {len(relevant_chunks)} chunks")
+    
     else:
         relevant_chunks: List[str] = []
         best_distance = float('inf')
@@ -178,7 +254,8 @@ def query_document(
                 if dist < best_distance:
                     best_distance = dist
         
-        print(f"{len(relevant_chunks)} chunks passed threshold")
+        print(f"  → {len(relevant_chunks)} chunks passed threshold")
+    
     if relevant_chunks:
         context = "\n\n---\n\n".join(relevant_chunks)
         
@@ -189,52 +266,62 @@ Your task:
 - Provide a concise summary of the document based on the provided text
 - Highlight the main points and key information
 - Organize the summary in a clear, structured way
-- Keep it to 3-5 sentences for brief overviews, or longer if the user asks for detailed summary
+- Keep it to 3-5 sentences unless asked for more detail
 
-DO NOT:
-- Make up information not in the text
-- Say you can't find information (you have the full context)
-"""
+DO NOT make up information not in the text."""
 
-            user_prompt = f"""Below is the content from a document. Provide a clear, comprehensive summary.
-
-DOCUMENT CONTENT:
+            user_prompt = f"""DOCUMENT CONTENT:
 {context}
 
 USER QUESTION: {question}
 
-Provide a helpful summary based on the content above."""
+Provide a clear summary based on the content above."""
+        
+        elif is_identity_question:
+            system_prompt = """You are a helpful assistant answering questions about people mentioned in documents.
+
+Your task:
+- Answer the question based ONLY on the information provided in the document content
+- Be specific and cite relevant details (education, position, achievements, etc.)
+- If the person is mentioned but no details are given, say so
+- Do NOT make up biographical information"""
+
+            user_prompt = f"""DOCUMENT CONTENT:
+{context}
+
+QUESTION: {question}
+
+Answer based only on what's mentioned in the document above."""
         
         else:
-            system_prompt = """You are a PDF document assistant. Your job is to answer questions based ONLY on the provided context from the document.
+            system_prompt = """You are a PDF document assistant. Answer questions based ONLY on the provided context.
 
 RULES:
-- Answer questions using ONLY the information in the CONTEXT below
-- If the answer is not in the context, say "I cannot find this information in the document"
+- Use ONLY information from the CONTEXT below
+- If the answer isn't in the context, say "I cannot find this information in the document"
 - Be concise and direct
-- Quote relevant parts when helpful
-- Do not make up information"""
+- Quote relevant parts when helpful"""
 
             user_prompt = f"""CONTEXT FROM DOCUMENT:
 {context}
 
 QUESTION: {question}
 
-Answer the question based only on the context above."""
+Answer based only on the context above."""
 
         source = "document"
         
     else:
-        system_prompt = """You are a helpful AI assistant. The user asked a question about their document, but no relevant information was found.
+        system_prompt = """You are a helpful AI assistant. The user asked about their document, but no relevant information was found.
 
 Your response should:
-1. Briefly acknowledge the information isn't in their document (1 sentence)
-2. Provide a helpful answer using your general knowledge if you have it
+1. Briefly acknowledge the information isn't in their document
+2. Provide helpful general knowledge if applicable
 3. Be friendly and conversational"""
 
         user_prompt = f"""Question: {question}
 
-This question isn't in the user's document. Please provide a helpful general knowledge response while briefly noting it's not in their document."""
+This information wasn't found in the user's document. Provide a helpful response."""
 
         source = "general_knowledge"
     
@@ -242,13 +329,13 @@ This question isn't in the user's document. Please provide a helpful general kno
     
     try:
         completion = groq_client.chat.completions.create(
-            model="llama-3.1-8b-instant",
+            model = "llama-3.3-70b-versatile" ,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
             temperature=0.0,
-            max_tokens=800 if is_summary_question else 500  
+            max_tokens=800 if is_summary_question else 500
         )
         
         answer = completion.choices[0].message.content
@@ -256,10 +343,11 @@ This question isn't in the user's document. Please provide a helpful general kno
     except Exception as e:
         print(f"Groq API call failed: {e}")
         return {
-            "answer": "Failed to generate response. Please check your API key and try again.",
+            "answer": "Failed to generate response.",
             "source": "error",
             "chunks_used": 0
         }
+    
     response: Dict[str, Any] = {
         "answer": answer,
         "source": source,
@@ -267,9 +355,7 @@ This question isn't in the user's document. Please provide a helpful general kno
         "best_distance": best_distance if relevant_chunks else None
     }
     
-    print("Query completed")
-    print(f"Source: {source}")
-    print(f"Chunks used: {len(relevant_chunks)}\n")
+    print(f"Query completed - Source: {source}, Chunks: {len(relevant_chunks)}\n")
     
     return response
 
