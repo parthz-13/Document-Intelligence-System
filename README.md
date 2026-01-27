@@ -26,7 +26,7 @@ An AI-powered document query system that allows users to upload PDFs and ask que
 - **ChromaDB**: Vector database for document embeddings
 - **PyPDF**: PDF text extraction
 - **SQLAlchemy**: ORM for database operations
-- **Groq API**: LLM integration (Llama 3.1)
+- **Groq API**: LLM integration (Llama 3.3-70b-versatile)
 - **JWT**: Secure authentication
 
 **Frontend:**
