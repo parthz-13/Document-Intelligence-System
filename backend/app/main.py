@@ -71,7 +71,7 @@ class QueryResponse(BaseModel):
     answer: str
     source: str
     chunks_used: int
-    best_distance: float | None
+    best_distance: float | None = None
 
 
 class DocumentResponse(BaseModel):
