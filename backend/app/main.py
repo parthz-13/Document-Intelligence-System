@@ -173,16 +173,19 @@ async def upload_pdf(
             status_code=status.HTTP_400_BAD_REQUEST, detail="Only PDF files are allowed"
         )
 
-    temp_file_path = os.path.join(UPLOAD_DIR, f"temp_{current_user.id}_{file.filename}")
-
     try:
-        with open(temp_file_path, "wb") as buffer:
+        # Use a more permanent file path
+        # Prefix with user_id to avoid name collisions between users
+        permanent_filename = f"user_{current_user.id}_{file.filename}"
+        permanent_file_path = os.path.join(UPLOAD_DIR, permanent_filename)
+
+        with open(permanent_file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
         print(f"\nProcessing upload from user {current_user.email}")
 
         document = process_pdf(
-            file_path=temp_file_path,
+            file_path=permanent_file_path,
             filename=file.filename,
             user_id=current_user.id,
             db=db,
@@ -197,14 +200,13 @@ async def upload_pdf(
         }
 
     except Exception as e:
+        # If processing failed, we should probably remove the file to avoid clutter
+        if "permanent_file_path" in locals() and os.path.exists(permanent_file_path):
+            os.remove(permanent_file_path)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to process PDF: {str(e)}",
         )
-
-    finally:
-        if os.path.exists(temp_file_path):
-            os.remove(temp_file_path)
 
 
 @app.get("/documents", response_model=List[DocumentResponse])

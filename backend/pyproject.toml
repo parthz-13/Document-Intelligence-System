@@ -10,6 +10,7 @@ dependencies = [
     "chromadb>=1.4.1",
     "fastapi>=0.128.0",
     "groq>=1.0.0",
+    "httpx>=0.28.1",
     "passlib[bcrypt]>=1.7.4",
     "psycopg2-binary>=2.9.11",
     "psycopg[binary]>=3.3.2",
@@ -21,7 +22,6 @@ dependencies = [
     "python-multipart>=0.0.21",
     "qdrant-client>=1.16.2",
     "ruff>=0.14.13",
-    "sentence-transformers>=5.2.2",
     "sqlalchemy>=2.0.45",
     "uvicorn>=0.40.0",
 ]
