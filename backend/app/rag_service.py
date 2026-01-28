@@ -1,20 +1,72 @@
 from typing import List, Dict, Any
 import os
 from pypdf import PdfReader
-import chromadb
 from groq import Groq
 from sqlalchemy.orm import Session
 import sys
 from app.database import settings
 from app.models import Document
 
+
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-chroma_client = chromadb.PersistentClient(path=settings.chroma_db_path)
-collection = chroma_client.get_or_create_collection(
-    name="pdf_documents",
-    metadata={"description": "PDF document chunks with embeddings"},
+from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, VectorParams, PointStruct, PayloadSchemaType
+from sentence_transformers import SentenceTransformer
+import uuid
+import os
+
+qdrant_client = QdrantClient(
+    url=settings.qdrant_url,
+    api_key=settings.qdrant_api_key,
 )
+
+embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+
+COLLECTION_NAME = "pdf_documents"
+
+def initialize_qdrant():
+    try:
+        qdrant_client.get_collection(COLLECTION_NAME)
+        print(f"Collection '{COLLECTION_NAME}' exists")
+        
+        for field_name in ["doc_id", "user_id"]:
+            try:
+                qdrant_client.create_payload_index(
+                    collection_name=COLLECTION_NAME,
+                    field_name=field_name,
+                    field_schema=PayloadSchemaType.KEYWORD
+                )
+                print(f"Created index on '{field_name}'")
+            except Exception as e:
+                print(f"Index '{field_name}' exists or error: {str(e)[:50]}")
+                
+    except Exception:
+        print(f"Creating collection '{COLLECTION_NAME}'...")
+        
+        qdrant_client.create_collection(
+            collection_name=COLLECTION_NAME,
+            vectors_config=VectorParams(
+                size=384,  
+                distance=Distance.COSINE
+            )
+        )
+        
+        qdrant_client.create_payload_index(
+            collection_name=COLLECTION_NAME,
+            field_name="doc_id",
+            field_schema=PayloadSchemaType.KEYWORD
+        )
+        
+        qdrant_client.create_payload_index(
+            collection_name=COLLECTION_NAME,
+            field_name="user_id",
+            field_schema=PayloadSchemaType.KEYWORD
+        )
+        
+        print("Created collection with indexes")
+
+initialize_qdrant()
 
 
 groq_client = Groq(api_key=settings.groq_api_key)
@@ -88,27 +140,37 @@ def process_pdf(file_path: str, filename: str, user_id: int, db: Session) -> Doc
     doc_id = str(document.id)
     print(f"Created document record (ID: {doc_id})")
 
-    print("Storing embeddings in ChromaDB...")
+    print("Storing embeddings in Qdrant...")
 
-    chunk_ids = [f"{doc_id}_chunk_{i}" for i in range(len(chunks))]
+    embeddings = embedding_model.encode(chunks).tolist()
+    
+    points = []
+    for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
+        points.append(
+            PointStruct(
+                id=str(uuid.uuid4()), 
+                vector=embedding,
+                payload={
+                    "doc_id": doc_id,
+                    "user_id": str(user_id),
+                    "chunk_index": i,
+                    "filename": filename,
+                    "text": chunk  
+                }
+            )
+        )
+    
 
-    metadatas: List[Dict[str, Any]] = [
-        {
-            "doc_id": doc_id,
-            "user_id": str(user_id),
-            "chunk_index": i,
-            "filename": filename,
-        }
-        for i in range(len(chunks))
-    ]
-
-    collection.add(documents=chunks, ids=chunk_ids, metadatas=metadatas)
-
+    qdrant_client.upsert(
+        collection_name=COLLECTION_NAME,
+        points=points
+    )
+    
     print(f"PDF processed successfully: {filename}")
     print(f"Document ID: {doc_id}")
     print(f"Chunks: {len(chunks)}")
     print(f"Pages: {page_count}\n")
-
+    
     return document
 
 
@@ -118,7 +180,7 @@ def query_document(
     user_id: int,
     n_results: int = 5
 ) -> Dict[str, Any]:
-    print(f"QUERY DEBUG")
+    print("QUERY DEBUG")
     print(f"Document ID: {document_id}")
     print(f"Question: {question}")
     
@@ -140,30 +202,40 @@ def query_document(
     is_identity_question = any(keyword in question.lower() for keyword in identity_keywords)
     
     try:
-        doc_chunks = collection.get(
-            where={"doc_id": doc_id}
+        count_result = qdrant_client.count(
+            collection_name=COLLECTION_NAME,
+            count_filter={
+                "must": [
+                    {"key": "doc_id", "match": {"value": doc_id}}
+                ]
+            }
         )
-        total_chunks = len(doc_chunks.get("ids", []))
-        print(f"\nDocument has {total_chunks} chunks in ChromaDB")
+        
+        total_chunks = count_result.count
+        print(f"\nDocument has {total_chunks} chunks in Qdrant")
         
         if total_chunks == 0:
             return {
                 "answer": "This document has no content. Please re-upload it.",
                 "source": "error",
-                "chunks_used": 0
+                "chunks_used": 0,
+                "best_distance": None
             }
             
     except Exception as e:
-        print(f"Error accessing ChromaDB: {e}")
+        print(f"Error accessing Qdrant: {e}")
+        import traceback
+        traceback.print_exc()
         return {
             "answer": "Failed to access document storage. Please try again.",
             "source": "error",
-            "chunks_used": 0
+            "chunks_used": 0,
+            "best_distance": None
         }
     
     if is_summary_question:
         print("Detected SUMMARY question")
-        n_results = min(10, total_chunks)
+        n_results = min(10, total_chunks)  
         SIMILARITY_THRESHOLD = 2.0
         
     elif is_identity_question:
@@ -175,30 +247,42 @@ def query_document(
         print("Specific question")
         SIMILARITY_THRESHOLD = 1.63
     
+    
     try:
-        results = collection.query(
-            query_texts=[question],
-            n_results=n_results,
-            where={"doc_id": doc_id}
+        question_embedding = embedding_model.encode([question])[0].tolist()
+        
+        search_results = qdrant_client.query_points(
+            collection_name=COLLECTION_NAME,
+            query=question_embedding,
+            query_filter={
+                "must": [
+                    {"key": "doc_id", "match": {"value": doc_id}}
+                ]
+            },
+            limit=n_results,
+            with_payload=True,
+            with_vectors=False 
         )
-        print(f"Query returned {len(results.get('documents', [[]])[0])} results")
+        
+        print(f"Query returned {len(search_results.points)} results")
+        
+        documents = []
+        distances = []
+        
+        for hit in search_results.points:
+            documents.append(hit.payload["text"])
+            distances.append(1 - hit.score)  
+        
     except Exception as e:
-        print(f"ChromaDB query failed: {e}")
+        print(f"Qdrant query failed: {e}")
+        import traceback
+        traceback.print_exc()
         return {
             "answer": "Search failed. Please try again.",
             "source": "error",
-            "chunks_used": 0
+            "chunks_used": 0,
+            "best_distance": None
         }
-    
-    docs_result = results.get("documents")
-    distances_result = results.get("distances")
-    
-    if docs_result and isinstance(docs_result, list) and len(docs_result) > 0:
-        documents = docs_result[0]
-        distances = distances_result[0] if distances_result else []
-    else:
-        documents = []
-        distances = []
     
     if is_identity_question:
         import re
@@ -241,20 +325,20 @@ def query_document(
     elif is_summary_question:
         relevant_chunks = documents[:10]
         best_distance = min(distances) if distances else None
-        print(f"  → Summary mode: Using {len(relevant_chunks)} chunks")
+        print(f"Summary mode: Using {len(relevant_chunks)} chunks")
     
     else:
         relevant_chunks: List[str] = []
         best_distance = float('inf')
         
         for doc, dist in zip(documents, distances):
-            print(f"  → Chunk distance: {dist:.3f}")
+            print(f"Chunk distance: {dist:.3f}")
             if dist < SIMILARITY_THRESHOLD:
                 relevant_chunks.append(doc)
                 if dist < best_distance:
                     best_distance = dist
         
-        print(f"  → {len(relevant_chunks)} chunks passed threshold")
+        print(f"{len(relevant_chunks)} chunks passed threshold")
     
     if relevant_chunks:
         context = "\n\n---\n\n".join(relevant_chunks)
@@ -375,18 +459,27 @@ def delete_document(document_id: int, user_id: int, db: Session) -> bool:
 
     try:
         doc_id = str(document_id)
-        collection.delete(where={"doc_id": doc_id})
-        print(f"Deleted {document.chunk_count} chunks from ChromaDB")
+        
+        qdrant_client.delete(
+            collection_name=COLLECTION_NAME,
+            points_selector={
+                "filter": {
+                    "must": [
+                        {"key": "doc_id", "match": {"value": doc_id}}
+                    ]
+                }
+            }
+        )
+        
+        print("Deleted chunks from Qdrant")
     except Exception as e:
-        print(f"Warning: Failed to delete from ChromaDB: {e}")
-
+        print(f"Warning: Failed to delete from Qdrant: {e}")
+    
     db.delete(document)
     db.commit()
-    print("Deleted document record from database")
-
-    print(f"Document {document_id} deleted successfully\n")
+    
+    print(f"Document {document_id} deleted successfully")
     return True
-
 
 def get_user_documents(user_id: int, db: Session) -> List[Document]:
     documents = (

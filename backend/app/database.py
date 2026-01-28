@@ -12,7 +12,8 @@ class Settings:
     algorithm: str = os.getenv("ALGORITHM", "HS256")
     access_token_expire_minutes: int = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "1440"))
     groq_api_key: str = os.getenv("GROQ_API_KEY", "")
-    chroma_db_path: str = os.getenv("CHROMA_DB_PATH", "./chroma_db")
+    qdrant_url: str = os.getenv("QDRANT_URL", "")
+    qdrant_api_key: str = os.getenv("QDRANT_API_KEY", "")
 
 settings = Settings()
 
@@ -22,6 +23,10 @@ if not settings.groq_api_key:
     raise ValueError("GROQ_API_KEY not set in .env")
 if not settings.database_url:
     raise ValueError("DATABASE_URL not set in .env")
+if not settings.qdrant_url:
+    raise ValueError("QDRANT_URL not set in .env")
+if not settings.qdrant_api_key:
+    raise ValueError("QDRANT_API_KEY not set in .env")
 
 engine = create_engine(
     settings.database_url,
