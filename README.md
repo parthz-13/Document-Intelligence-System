@@ -6,6 +6,8 @@ An AI-powered document query system that allows users to upload PDFs and ask que
 ![React](https://img.shields.io/badge/react-%2320232a.svg?style=for-the-badge&logo=react&logoColor=%2361DAFB)
 ![PostgreSQL](https://img.shields.io/badge/postgresql-%23316192.svg?style=for-the-badge&logo=postgresql&logoColor=white)
 ![Python](https://img.shields.io/badge/python-3670A0?style=for-the-badge&logo=python&logoColor=ffdd54)
+![Jina AI](https://img.shields.io/badge/Jina_AI-Embeddings-brightgreen)
+![Qdrant](https://img.shields.io/badge/Qdrant-Vector_DB-blue)
 
 
 ## Features
