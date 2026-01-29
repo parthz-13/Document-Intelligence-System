@@ -106,7 +106,7 @@ async def startup_event():
 async def root():
     return {"message": "Welcome to PDF RAG API", "docs": "/docs", "health": "/health"}
 
-
+@app.head("/health")
 @app.get("/health")
 async def health_check():
     return {"status": "healthy", "message": "PDF RAG API is running"}
