@@ -115,7 +115,8 @@ function Home() {
               Drag and drop a PDF or{" "}
               <label htmlFor="file-upload" className="upload-label">
                 browse files
-              </label>
+              </label><br></br>
+              PDF formats, upto 10MB
             </p>
           )}
         </div>
