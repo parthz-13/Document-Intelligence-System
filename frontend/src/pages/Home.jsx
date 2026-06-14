@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { useNavigate } from "react-router-dom";
-import { getDocuments, uploadDocument, deleteDocument } from "../api";
+import { getDocuments, uploadDocument, deleteDocument, getPdfBlob } from "../api";
 
 function Home() {
   const [documents, setDocuments] = useState([]);
@@ -63,6 +63,18 @@ function Home() {
       setSuccess("Document deleted");
     } catch (err) {
       setError("Failed to delete document");
+    }
+  };
+
+  const handleViewPdf = async (e, doc) => {
+    e.stopPropagation();
+    e.preventDefault();
+    try {
+      const blob = await getPdfBlob(doc.id);
+      const url = URL.createObjectURL(blob);
+      window.open(url, "_blank");
+    } catch {
+      setError("Failed to open PDF");
     }
   };
 
@@ -156,6 +168,14 @@ function Home() {
                   </div>
                 </div>
                 <div className="document-actions">
+                  {doc.pdf_url && (
+                    <button
+                      className="btn btn-secondary btn-small"
+                      onClick={(e) => handleViewPdf(e, doc)}
+                    >
+                      View PDF
+                    </button>
+                  )}
                   <button
                     className="btn btn-danger btn-small"
                     onClick={(e) => handleDelete(e, doc.id)}

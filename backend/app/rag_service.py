@@ -1,60 +1,77 @@
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Generator, Optional
 import os
-from pypdf import PdfReader
-from groq import Groq
-from sqlalchemy.orm import Session
+import re
 import sys
-from app.database import settings
-from app.models import Document
+import time
+import uuid
 
+import cloudinary
+import cloudinary.uploader
+import httpx
+from fastembed import SparseTextEmbedding
+from groq import Groq
+from pypdf import PdfReader
+from sqlalchemy.orm import Session
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams, PointStruct, PayloadSchemaType
-import httpx
+from qdrant_client.models import (
+    Distance, VectorParams, PointStruct, PayloadSchemaType,
+    SparseVectorParams, SparseIndexParams, SparseVector,
+    Prefetch, FusionQuery, Fusion,
+)
 
-import uuid
-import os
+from app.database import SessionLocal, settings
+from app.models import Document
 
+
+# ── Constants ──────────────────────────────────────────────────────────────────
 
 JINA_API_URL = "https://api.jina.ai/v1/embeddings"
+JINA_RERANKER_URL = "https://api.jina.ai/v1/rerank"
 JINA_API_KEY = os.getenv("JINA_API_KEY")
+COLLECTION_NAME = os.getenv("QDRANT_COLLECTION_NAME", "pdf_documents")
+HYBRID_COLLECTION = "pdf_documents_v2"
+
+# BM25 sparse encoder (downloads ~5 MB model on first use, then cached)
+print("Loading BM25 sparse encoder...")
+_bm25_encoder = SparseTextEmbedding(model_name="Qdrant/bm25")
+print("BM25 encoder ready")
 
 
-COLLECTION_NAME = "pdf_documents"
+# ── Cloudinary ─────────────────────────────────────────────────────────────────
+
+cloudinary.config(
+    cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
+    api_key=os.getenv("CLOUDINARY_API_KEY"),
+    api_secret=os.getenv("CLOUDINARY_API_SECRET"),
+)
 
 
-def generate_embedding(text: str) -> List[float]:
+def upload_to_cloudinary(file_path: str, filename: str, user_id: int) -> tuple[Optional[str], Optional[str]]:
+    """Upload PDF to Cloudinary, return (secure_url, public_id) or (None, None) on failure."""
     try:
-        response = httpx.post(
-            JINA_API_URL,
-            headers={
-                "Authorization": f"Bearer {JINA_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={"input": [text], "model": "jina-embeddings-v2-base-en"},
-            timeout=30.0,
+        stem = os.path.splitext(filename)[0]
+        result = cloudinary.uploader.upload(
+            file_path,
+            resource_type="raw",
+            folder=f"doc-intelligence/{user_id}",
+            public_id=f"{user_id}_{stem}.pdf",
+            overwrite=True,
         )
-        response.raise_for_status()
-
-        data = response.json()
-        embedding = data["data"][0]["embedding"]
-
-        return embedding
-
+        return result["secure_url"], result["public_id"]
     except Exception as e:
-        print(f"Error generating embedding: {e}")
-        raise Exception(f"Failed to generate embedding: {str(e)}")
+        print(f"Cloudinary upload failed: {e}")
+        return None, None
 
 
+# ── Qdrant ─────────────────────────────────────────────────────────────────────
 
 qdrant_client = QdrantClient(
     url=os.getenv("QDRANT_URL"),
     api_key=os.getenv("QDRANT_API_KEY"),
 )
-
-COLLECTION_NAME = "pdf_documents"
 
 
 def initialize_qdrant():
@@ -68,498 +85,856 @@ def initialize_qdrant():
                     field_name=field_name,
                     field_schema=PayloadSchemaType.KEYWORD,
                 )
-                print(f"Created index on '{field_name}'")
             except Exception:
-                print(f"Index '{field_name}' may already exist")
-
+                pass
     except Exception:
         print(f"Creating collection '{COLLECTION_NAME}'...")
-
         qdrant_client.create_collection(
             collection_name=COLLECTION_NAME,
-            vectors_config=VectorParams(
-                size=768,  
-                distance=Distance.COSINE,
-            ),
+            vectors_config=VectorParams(size=768, distance=Distance.COSINE),
         )
-
-        qdrant_client.create_payload_index(
-            collection_name=COLLECTION_NAME,
-            field_name="doc_id",
-            field_schema=PayloadSchemaType.KEYWORD,
-        )
-
-        qdrant_client.create_payload_index(
-            collection_name=COLLECTION_NAME,
-            field_name="user_id",
-            field_schema=PayloadSchemaType.KEYWORD,
-        )
-
+        for field_name in ["doc_id", "user_id"]:
+            qdrant_client.create_payload_index(
+                collection_name=COLLECTION_NAME,
+                field_name=field_name,
+                field_schema=PayloadSchemaType.KEYWORD,
+            )
         print("Created collection with 768-dim vectors")
 
 
 initialize_qdrant()
 
 
+def initialize_hybrid_collection():
+    """Create pdf_documents_v2 with dense + sparse vector configs if it doesn't exist."""
+    try:
+        qdrant_client.get_collection(HYBRID_COLLECTION)
+        print(f"Hybrid collection '{HYBRID_COLLECTION}' exists")
+    except Exception:
+        print(f"Creating hybrid collection '{HYBRID_COLLECTION}'...")
+        qdrant_client.create_collection(
+            collection_name=HYBRID_COLLECTION,
+            vectors_config={"dense": VectorParams(size=768, distance=Distance.COSINE)},
+            sparse_vectors_config={
+                "sparse": SparseVectorParams(index=SparseIndexParams(on_disk=False))
+            },
+        )
+        for field_name in ["doc_id", "user_id"]:
+            qdrant_client.create_payload_index(
+                collection_name=HYBRID_COLLECTION,
+                field_name=field_name,
+                field_schema=PayloadSchemaType.KEYWORD,
+            )
+        print(f"Hybrid collection '{HYBRID_COLLECTION}' created")
+
+
+initialize_hybrid_collection()
+
+
+def generate_sparse_vector(text: str) -> SparseVector:
+    """BM25 sparse encoding via fastembed (runs locally, no API call)."""
+    result = list(_bm25_encoder.embed([text]))[0]
+    return SparseVector(
+        indices=result.indices.tolist(),
+        values=result.values.tolist(),
+    )
+
+
 groq_client = Groq(api_key=settings.groq_api_key)
 
 
-def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 200) -> List[str]:
-    chunks = []
+# ── Embeddings ─────────────────────────────────────────────────────────────────
+
+def generate_embeddings_batch(texts: List[str], batch_size: int = 32) -> List[List[float]]:
+    """Batch embed texts via Jina API. Returns embeddings in the same order as input."""
+    all_embeddings: List[List[float]] = []
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i : i + batch_size]
+        try:
+            response = httpx.post(
+                JINA_API_URL,
+                headers={
+                    "Authorization": f"Bearer {JINA_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={"input": batch, "model": "jina-embeddings-v2-base-en"},
+                timeout=60.0,
+            )
+            response.raise_for_status()
+            items = sorted(response.json()["data"], key=lambda x: x["index"])
+            all_embeddings.extend(item["embedding"] for item in items)
+        except Exception as e:
+            raise Exception(f"Embedding batch {i // batch_size} failed: {e}")
+    return all_embeddings
+
+
+def generate_embedding(text: str) -> List[float]:
+    return generate_embeddings_batch([text])[0]
+
+
+# ── Reranker ───────────────────────────────────────────────────────────────────
+
+def rerank_chunks(query: str, chunks: List[Dict], top_n: int = 5) -> List[Dict]:
+    """Re-rank chunks with Jina cross-encoder. Falls back to original order on failure."""
+    if not chunks:
+        return chunks
+    try:
+        response = httpx.post(
+            JINA_RERANKER_URL,
+            headers={
+                "Authorization": f"Bearer {JINA_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "jina-reranker-v2-base-multilingual",
+                "query": query,
+                "documents": [c["text"] for c in chunks],
+                "top_n": min(top_n, len(chunks)),
+            },
+            timeout=15.0,
+        )
+        response.raise_for_status()
+        results = sorted(response.json()["results"], key=lambda r: r["relevance_score"], reverse=True)
+        return [chunks[r["index"]] for r in results]
+    except Exception as e:
+        print(f"Reranker failed, using original order: {e}")
+        return chunks[:top_n]
+
+
+# ── Chunking ───────────────────────────────────────────────────────────────────
+
+def extract_pages_from_pdf(file_path: str) -> tuple:
+    """Returns (total_page_count, [(page_num, page_text), ...]) for non-empty pages."""
+    try:
+        reader = PdfReader(file_path)
+        total_pages = len(reader.pages)
+        pages = []
+        for page_num, page in enumerate(reader.pages, start=1):
+            page_text = page.extract_text() or ""
+            if page_text.strip():
+                pages.append((page_num, page_text))
+        if not pages:
+            raise ValueError("No text could be extracted from the PDF")
+        return total_pages, pages
+    except Exception as e:
+        raise Exception(f"Failed to extract text from PDF: {e}")
+
+
+def chunk_document(pages: List[tuple], chunk_size: int = 800, overlap: int = 150) -> List[Dict]:
+    """
+    Sentence-boundary-aware chunker that tracks the page number for each chunk.
+    Returns list of {"text", "page_number", "chunk_index"} dicts.
+    """
+    # Build flat (text, page_num) representation
+    full_text = ""
+    page_at_pos: List[int] = []
+    for page_num, page_text in pages:
+        start = len(full_text)
+        full_text += page_text
+        page_at_pos.extend([page_num] * (len(full_text) - start))
+
+    total = len(full_text)
+    chunks: List[Dict] = []
     start = 0
-    text_length = len(text)
+    chunk_index = 0
 
-    while start < text_length:
-        end = start + chunk_size
-        chunk = text[start:end].strip()
+    while start < total:
+        end = min(start + chunk_size, total)
 
-        if chunk:
-            chunks.append(chunk)
+        # Scan back for a sentence boundary so we don't cut mid-word/sentence
+        if end < total:
+            search_from = max(start, end - 200)
+            best_break = -1
+            for i in range(end - 1, search_from - 1, -1):
+                ch = full_text[i]
+                next_ch = full_text[i + 1] if i + 1 < total else ""
+                if ch in ".!?" and next_ch in (" ", "\n"):
+                    best_break = i + 2
+                    break
+                if ch == "\n" and next_ch == "\n":
+                    best_break = i + 2
+                    break
+            if best_break > start:
+                end = best_break
 
-        start += chunk_size - overlap
+        chunk_text = full_text[start:end].strip()
+        chunk_page = page_at_pos[start] if start < len(page_at_pos) else pages[0][0]
+
+        if chunk_text:
+            chunks.append({
+                "text": chunk_text,
+                "page_number": chunk_page,
+                "chunk_index": chunk_index,
+            })
+            chunk_index += 1
+
+        next_start = end - overlap
+        start = next_start if next_start > start else end
 
     return chunks
 
 
-def extract_text_from_pdf(file_path: str) -> str:
-    try:
-        reader = PdfReader(file_path)
-        text = ""
-
-        for page_num, page in enumerate(reader.pages):
-            page_text = page.extract_text()
-            if page_text:
-                text += page_text + "\n\n"
-
-        if not text.strip():
-            raise ValueError("No text could be extracted from the PDF")
-
-        return text.strip()
-
-    except Exception as e:
-        raise Exception(f"Failed to extract text from PDF: {str(e)}")
-
+# ── Process PDF ────────────────────────────────────────────────────────────────
 
 def process_pdf(file_path: str, filename: str, user_id: int, db: Session) -> Document:
     print(f"\nProcessing PDF: {filename}")
 
-    print("Extracting text from PDF...")
-    text = extract_text_from_pdf(file_path)
-
-    reader = PdfReader(file_path)
-    page_count = len(reader.pages)
+    total_pages, pages = extract_pages_from_pdf(file_path)
     file_size = os.path.getsize(file_path)
+    print(f"Extracted text from {len(pages)} of {total_pages} pages")
 
-    print(f"Extracted {len(text)} characters from {page_count} pages")
-
-    print("Chunking text...")
-    chunks = chunk_text(text, chunk_size=1000, overlap=200)
-    print(f"Created {len(chunks)} chunks")
+    chunk_dicts = chunk_document(pages, chunk_size=800, overlap=150)
+    print(f"Created {len(chunk_dicts)} chunks")
 
     document = Document(
         user_id=user_id,
         filename=filename,
         original_filename=filename,
         file_size=file_size,
-        page_count=page_count,
-        chunk_count=len(chunks),
+        page_count=total_pages,
+        chunk_count=len(chunk_dicts),
+        has_page_numbers=True,
     )
     db.add(document)
-    db.flush()  
-
+    db.flush()
     doc_id = str(document.id)
     print(f"Created document record (ID: {doc_id})")
 
-    print("Generating embeddings with Jina AI...")
+    texts = [c["text"] for c in chunk_dicts]
+    print(f"Generating {len(texts)} embeddings (batched)...")
+    embeddings = generate_embeddings_batch(texts)
 
-    points = []
-    for i, chunk in enumerate(chunks):
-        try:
-            embedding = generate_embedding(chunk)
-
-            points.append(
-                PointStruct(
-                    id=str(uuid.uuid4()),
-                    vector=embedding,
-                    payload={
-                        "doc_id": doc_id,
-                        "user_id": str(user_id),
-                        "chunk_index": i,
-                        "filename": filename,
-                        "text": chunk,
-                    },
-                )
-            )
-
-            if (i + 1) % 5 == 0:
-                print(f"Processed {i + 1}/{len(chunks)} chunks...")
-
-        except Exception as e:
-            print(f"Failed to embed chunk {i}: {e}")
-
-    if not points:
-        db.rollback()
-        raise RuntimeError("All embeddings failed. Document was NOT indexed.")
+    points = [
+        PointStruct(
+            id=str(uuid.uuid4()),
+            vector=embedding,
+            payload={
+                "doc_id": doc_id,
+                "user_id": str(user_id),
+                "chunk_index": c["chunk_index"],
+                "page_number": c["page_number"],
+                "filename": filename,
+                "text": c["text"],
+            },
+        )
+        for c, embedding in zip(chunk_dicts, embeddings)
+    ]
 
     try:
-        print(f"DEBUG: points length before upsert = {len(points)}")
         qdrant_client.upsert(collection_name=COLLECTION_NAME, points=points)
-        print(f"Uploaded {len(points)} chunks to Qdrant")
-
-        db.commit()
-        db.refresh(document)
-        print(f"Committed document record to database")
-
+        print(f"Uploaded {len(points)} chunks to Qdrant (dense)")
     except Exception as e:
         db.rollback()
-        print(f"Failed to upload to Qdrant: {e}")
-        raise RuntimeError(f"Qdrant indexing failed: {str(e)}")
+        raise RuntimeError(f"Qdrant indexing failed: {e}")
 
-    print(f"PDF processed successfully: {filename}")
-    print(f"Document ID: {document.id}")
-    print(f"Chunks: {len(chunks)}")
-    print(f"Pages: {page_count}\n")
+    # Also index into hybrid collection with sparse vectors
+    try:
+        print("Generating sparse (BM25) vectors and indexing into hybrid collection...")
+        hybrid_points = [
+            PointStruct(
+                id=str(uuid.uuid4()),
+                vector={
+                    "dense": embedding,
+                    "sparse": generate_sparse_vector(c["text"]),
+                },
+                payload={
+                    "doc_id": doc_id,
+                    "user_id": str(user_id),
+                    "chunk_index": c["chunk_index"],
+                    "page_number": c["page_number"],
+                    "filename": filename,
+                    "text": c["text"],
+                },
+            )
+            for c, embedding in zip(chunk_dicts, embeddings)
+        ]
+        qdrant_client.upsert(collection_name=HYBRID_COLLECTION, points=hybrid_points)
+        print(f"Uploaded {len(hybrid_points)} chunks to hybrid collection")
+    except Exception as e:
+        print(f"Hybrid indexing failed (non-fatal): {e}")
 
+    print("Uploading to Cloudinary...")
+    pdf_url, pdf_public_id = upload_to_cloudinary(file_path, filename, user_id)
+    document.pdf_url = pdf_url
+    document.pdf_public_id = pdf_public_id
+    if pdf_url:
+        print(f"Cloudinary URL: {pdf_url} (public_id: {pdf_public_id})")
+    else:
+        print("Cloudinary upload skipped (credentials missing or error)")
+
+    db.commit()
+    db.refresh(document)
+    print(f"PDF processed successfully: {filename} ({len(chunk_dicts)} chunks, {total_pages} pages)\n")
     return document
 
 
-def query_document(
-    document_id: int, question: str, user_id: int, n_results: int = 5
-) -> Dict[str, Any]:
-    print("QUERY DEBUG")
-    print(f"Document ID: {document_id}")
-    print(f"Question: {question}")
+# ── Query helpers ──────────────────────────────────────────────────────────────
 
-    doc_id = str(document_id)
-
+def _classify_question(question: str, total_chunks: int) -> tuple:
+    """Returns (is_summary, is_identity, n_results, similarity_threshold)."""
     summary_keywords = [
-        "summary",
-        "summarize",
-        "summarise",
-        "overview",
-        "about",
-        "what is this",
-        "what's this",
-        "tell me about",
-        "main points",
-        "key points",
-        "gist",
-        "brief",
-        "describe this",
-        "content",
+        "summary", "summarize", "summarise", "overview", "about",
+        "what is this", "what's this", "tell me about", "main points",
+        "key points", "gist", "brief", "describe this", "content",
     ]
-
-    is_summary_question = any(
-        keyword in question.lower() for keyword in summary_keywords
-    )
-
     identity_keywords = [
-        "who is",
-        "who's",
-        "tell me about",
-        "information about",
-        "details about",
-        "background of",
-        "describe",
+        "who is", "who's", "tell me about", "information about",
+        "details about", "background of", "describe",
     ]
+    q = question.lower()
+    is_summary = any(kw in q for kw in summary_keywords)
+    is_identity = any(kw in q for kw in identity_keywords)
+    if is_summary or is_identity:
+        return is_summary, is_identity, min(10, total_chunks), 2.0
+    return False, False, 5, 1.63
 
-    is_identity_question = any(
-        keyword in question.lower() for keyword in identity_keywords
+
+def _build_prompt(question: str, context: str, is_summary: bool, is_identity: bool) -> tuple:
+    """Returns (system_prompt, user_prompt) for the LLM call."""
+    if is_summary:
+        return (
+            "You are a document summarization assistant. Provide a concise summary highlighting the main points in 3-5 sentences. DO NOT make up information not present in the text.",
+            f"DOCUMENT CONTENT:\n{context}\n\nUSER QUESTION: {question}\n\nProvide a clear summary.",
+        )
+    if is_identity:
+        return (
+            "You are a helpful assistant answering questions about people mentioned in documents. Answer based ONLY on the document content. Do NOT invent biographical information.",
+            f"DOCUMENT CONTENT:\n{context}\n\nQUESTION: {question}\n\nAnswer based only on what's mentioned in the document.",
+        )
+    return (
+        'You are a PDF document assistant. Answer questions based ONLY on the provided context.\nRULES:\n- Use ONLY information from the CONTEXT below\n- If the answer isn\'t in the context, say "I cannot find this information in the document"\n- Be concise and direct\n- Quote relevant parts when helpful',
+        f"CONTEXT FROM DOCUMENT:\n{context}\n\nQUESTION: {question}\n\nAnswer based only on the context above.",
     )
 
+
+def _extract_name(question: str) -> Optional[str]:
+    patterns = [
+        r"who (?:is|'s) ([A-Z][a-z]+(?: [A-Z][a-z]+)*)",
+        r"about ([A-Z][a-z]+(?: [A-Z][a-z]+)*)",
+        r"tell me about ([A-Z][a-z]+(?: [A-Z][a-z]+)*)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, question)
+        if match:
+            return match.group(1)
+    return None
+
+
+def _filter_chunks(
+    candidate_chunks: List[Dict],
+    is_summary: bool,
+    is_identity: bool,
+    effective_question: str,
+    similarity_threshold: float,
+) -> List[Dict]:
+    if is_summary:
+        return candidate_chunks[:10]
+    if is_identity:
+        name = _extract_name(effective_question)
+        if name:
+            name_chunks = [c for c in candidate_chunks if name.lower() in c["text"].lower()]
+            return name_chunks if name_chunks else []
+    return [c for c in candidate_chunks if c["distance"] < similarity_threshold]
+
+
+def _search_qdrant_with_query(doc_id: str, query_text: str, embedding: List[float], n_results: int) -> List[Dict]:
+    """Full hybrid search using both dense and sparse (BM25) vectors with RRF fusion."""
+    doc_filter = {"must": [{"key": "doc_id", "match": {"value": doc_id}}]}
+
     try:
-        count_result = qdrant_client.count(
-            collection_name=COLLECTION_NAME,
-            count_filter={"must": [{"key": "doc_id", "match": {"value": doc_id}}]},
-        )
+        count_in_v2 = qdrant_client.count(
+            collection_name=HYBRID_COLLECTION,
+            count_filter=doc_filter,
+        ).count
+    except Exception:
+        count_in_v2 = 0
 
-        total_chunks = count_result.count
-        print(f"\nDocument has {total_chunks} chunks in Qdrant")
+    if count_in_v2 > 0:
+        try:
+            sparse_vec = generate_sparse_vector(query_text)
+            results = qdrant_client.query_points(
+                collection_name=HYBRID_COLLECTION,
+                prefetch=[
+                    Prefetch(query=embedding, using="dense", limit=n_results * 3, filter=doc_filter),
+                    Prefetch(query=sparse_vec, using="sparse", limit=n_results * 3, filter=doc_filter),
+                ],
+                query=FusionQuery(fusion=Fusion.RRF),
+                limit=n_results,
+                with_payload=True,
+                with_vectors=False,
+            )
+            hits = results.points
+            print(f"Hybrid RRF search returned {len(hits)} results")
+        except Exception as e:
+            print(f"Hybrid search failed, falling back to dense: {e}")
+            hits = _dense_search(COLLECTION_NAME, embedding, doc_filter, n_results)
+    else:
+        hits = _dense_search(COLLECTION_NAME, embedding, doc_filter, n_results)
 
-        if total_chunks == 0:
-            return {
-                "answer": "This document has no content. Please re-upload it.",
-                "source": "error",
-                "chunks_used": 0,
-                "best_distance": None,
-            }
-
-    except Exception as e:
-        print(f"Error accessing Qdrant: {e}")
-        import traceback
-
-        traceback.print_exc()
-        return {
-            "answer": "Failed to access document storage. Please try again.",
-            "source": "error",
-            "chunks_used": 0,
-            "best_distance": None,
+    return [
+        {
+            "text": hit.payload["text"],
+            "page_number": hit.payload.get("page_number"),
+            "filename": hit.payload.get("filename", ""),
+            "score": hit.score,
+            "distance": 1 - hit.score,
         }
+        for hit in hits
+    ]
 
-    if is_summary_question:
-        print("Detected SUMMARY question")
-        n_results = min(10, total_chunks)
-        SIMILARITY_THRESHOLD = 2.0
 
-    elif is_identity_question:
-        print("Detected IDENTITY question")
-        n_results = min(10, total_chunks)
-        SIMILARITY_THRESHOLD = 2.0
+def _dense_search(collection: str, embedding: List[float], doc_filter: dict, n_results: int):
+    results = qdrant_client.query_points(
+        collection_name=collection,
+        query=embedding,
+        query_filter=doc_filter,
+        limit=n_results,
+        with_payload=True,
+        with_vectors=False,
+    )
+    return results.points
 
-    else:
-        print("Specific question")
-        SIMILARITY_THRESHOLD = 1.63
 
+# ── Query rewriting ────────────────────────────────────────────────────────────
+
+def rewrite_query(original_question: str, conversation_history: List[Dict]) -> str:
+    """Resolve coreferences using conversation history to produce a standalone question."""
+    if not conversation_history:
+        return original_question
     try:
-        question_embedding = generate_embedding(question)
-
-        search_results = qdrant_client.query_points(
-            collection_name=COLLECTION_NAME,
-            query=question_embedding,
-            query_filter={"must": [{"key": "doc_id", "match": {"value": doc_id}}]},
-            limit=n_results,
-            with_payload=True,
-            with_vectors=False,
+        history_text = "\n".join(
+            f"{m['role'].upper()}: {m['content']}" for m in conversation_history[-6:]
         )
-
-        print(f"Query returned {len(search_results.points)} results")
-
-        documents = []
-        distances = []
-
-        for hit in search_results.points:
-            documents.append(hit.payload["text"])
-            distances.append(1 - hit.score)
-
-    except Exception as e:
-        print(f"Qdrant query failed: {e}")
-        import traceback
-
-        traceback.print_exc()
-        return {
-            "answer": "Search failed. Please try again.",
-            "source": "error",
-            "chunks_used": 0,
-            "best_distance": None,
-        }
-
-    if is_identity_question:
-        import re
-
-        patterns = [
-            r"who (?:is|'s) ([A-Z][a-z]+(?: [A-Z][a-z]+)*)",
-            r"about ([A-Z][a-z]+(?: [A-Z][a-z]+)*)",
-            r"tell me about ([A-Z][a-z]+(?: [A-Z][a-z]+)*)",
-        ]
-
-        extracted_name = None
-        for pattern in patterns:
-            match = re.search(pattern, question)
-            if match:
-                extracted_name = match.group(1)
-                print(f"Extracted name from question: '{extracted_name}'")
-                break
-
-        if extracted_name:
-            print(f"Searching for mentions of '{extracted_name}' in document...")
-
-            name_chunks = []
-            for doc in documents:
-                if extracted_name.lower() in doc.lower():
-                    name_chunks.append(doc)
-                    print(f"Found in chunk: {doc[:80]}...")
-
-            if name_chunks:
-                relevant_chunks = name_chunks
-                best_distance = 0.0
-                print(
-                    f"Using {len(relevant_chunks)} chunks mentioning '{extracted_name}'"
-                )
-            else:
-                print(f"Name '{extracted_name}' not found in document")
-                relevant_chunks = []
-                best_distance = None
-        else:
-            relevant_chunks = [
-                doc
-                for doc, dist in zip(documents, distances)
-                if dist < SIMILARITY_THRESHOLD
-            ]
-            best_distance = min(distances) if distances else None
-
-    elif is_summary_question:
-        relevant_chunks = documents[:10]
-        best_distance = min(distances) if distances else None
-        print(f"Summary mode: Using {len(relevant_chunks)} chunks")
-
-    else:
-        relevant_chunks: List[str] = []
-        best_distance = float("inf")
-
-        for doc, dist in zip(documents, distances):
-            print(f"Chunk distance: {dist:.3f}")
-            if dist < SIMILARITY_THRESHOLD:
-                relevant_chunks.append(doc)
-                if dist < best_distance:
-                    best_distance = dist
-
-        print(f"{len(relevant_chunks)} chunks passed threshold")
-
-    if relevant_chunks:
-        context = "\n\n---\n\n".join(relevant_chunks)
-
-        if is_summary_question:
-            system_prompt = """You are a document summarization assistant.
-
-Your task:
-- Provide a concise summary of the document based on the provided text
-- Highlight the main points and key information
-- Organize the summary in a clear, structured way
-- Keep it to 3-5 sentences unless asked for more detail
-
-DO NOT make up information not in the text."""
-
-            user_prompt = f"""DOCUMENT CONTENT:
-{context}
-
-USER QUESTION: {question}
-
-Provide a clear summary based on the content above."""
-
-        elif is_identity_question:
-            system_prompt = """You are a helpful assistant answering questions about people mentioned in documents.
-
-Your task:
-- Answer the question based ONLY on the information provided in the document content
-- Be specific and cite relevant details (education, position, achievements, etc.)
-- If the person is mentioned but no details are given, say so
-- Do NOT make up biographical information"""
-
-            user_prompt = f"""DOCUMENT CONTENT:
-{context}
-
-QUESTION: {question}
-
-Answer based only on what's mentioned in the document above."""
-
-        else:
-            system_prompt = """You are a PDF document assistant. Answer questions based ONLY on the provided context.
-
-RULES:
-- Use ONLY information from the CONTEXT below
-- If the answer isn't in the context, say "I cannot find this information in the document"
-- Be concise and direct
-- Quote relevant parts when helpful"""
-
-            user_prompt = f"""CONTEXT FROM DOCUMENT:
-{context}
-
-QUESTION: {question}
-
-Answer based only on the context above."""
-
-        source = "document"
-
-    else:
-        system_prompt = """You are a helpful AI assistant. The user asked about their document, but no relevant information was found.
-
-Your response should:
-1. Briefly acknowledge the information isn't in their document
-2. Provide helpful general knowledge if applicable
-3. Be friendly and conversational"""
-
-        user_prompt = f"""Question: {question}
-
-This information wasn't found in the user's document. Provide a helpful response."""
-
-        source = "general_knowledge"
-
-    print(f"Calling Groq LLM (source: {source})...")
-
-    try:
         completion = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="llama-3.1-8b-instant",
             messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
+                {
+                    "role": "system",
+                    "content": "You are a query rewriting assistant. Rewrite the follow-up question as a complete standalone question that resolves all pronouns and references to the conversation. Output ONLY the rewritten question, nothing else.",
+                },
+                {
+                    "role": "user",
+                    "content": f"Conversation:\n{history_text}\n\nFollow-up: {original_question}\n\nRewrite as standalone question:",
+                },
             ],
             temperature=0.0,
-            max_tokens=800 if is_summary_question else 500,
+            max_tokens=150,
         )
+        return completion.choices[0].message.content.strip()
+    except Exception:
+        return original_question
 
-        answer = completion.choices[0].message.content
 
-    except Exception as e:
-        print(f"Groq API call failed: {e}")
+# ── Main query function ────────────────────────────────────────────────────────
+
+def query_document(
+    document_id: int,
+    question: str,
+    user_id: int,
+    conversation_history: Optional[List[Dict]] = None,
+    n_results: int = 5,
+) -> Dict[str, Any]:
+    print(f"Query — doc:{document_id} q:{question[:60]}")
+    doc_id = str(document_id)
+    history = conversation_history or []
+
+    effective_question = rewrite_query(question, history)
+    if effective_question != question:
+        print(f"Rewritten query: {effective_question}")
+
+    # Verify document has chunks
+    try:
+        total_chunks = qdrant_client.count(
+            collection_name=COLLECTION_NAME,
+            count_filter={"must": [{"key": "doc_id", "match": {"value": doc_id}}]},
+        ).count
+        if total_chunks == 0:
+            return {"answer": "This document has no content. Please re-upload it.", "source": "error", "chunks_used": 0, "best_distance": None, "citations": []}
+    except Exception:
+        return {"answer": "Failed to access document storage. Please try again.", "source": "error", "chunks_used": 0, "best_distance": None, "citations": []}
+
+    is_summary, is_identity, n_results, threshold = _classify_question(effective_question, total_chunks)
+
+    t_retrieval = time.perf_counter()
+    try:
+        embedding = generate_embedding(effective_question)
+        candidate_chunks = _search_qdrant_with_query(doc_id, effective_question, embedding, n_results)
+    except Exception:
+        return {"answer": "Search failed. Please try again.", "source": "error", "chunks_used": 0, "best_distance": None, "citations": []}
+    retrieval_ms = int((time.perf_counter() - t_retrieval) * 1000)
+
+    filtered = _filter_chunks(candidate_chunks, is_summary, is_identity, effective_question, threshold)
+
+    if not filtered:
+        system_prompt = "You are a helpful AI assistant. The user asked about their document, but no relevant information was found. Acknowledge this briefly and provide helpful general knowledge if applicable."
+        user_prompt = f"Question: {question}\n\nThis information wasn't found in the user's document. Provide a helpful response."
+        t_llm = time.perf_counter()
+        try:
+            msgs = [{"role": "system", "content": system_prompt}]
+            msgs += [{"role": m["role"], "content": m["content"]} for m in history[-6:]]
+            msgs.append({"role": "user", "content": user_prompt})
+            completion = groq_client.chat.completions.create(
+                model="llama-3.3-70b-versatile", messages=msgs, temperature=0.0, max_tokens=500,
+            )
+            answer = completion.choices[0].message.content
+        except Exception:
+            answer = "Failed to generate response."
         return {
-            "answer": "Failed to generate response.",
-            "source": "error",
+            "answer": answer,
+            "source": "general_knowledge",
             "chunks_used": 0,
+            "best_distance": None,
+            "citations": [],
+            "retrieval_latency_ms": retrieval_ms,
+            "llm_latency_ms": int((time.perf_counter() - t_llm) * 1000),
         }
 
-    response: Dict[str, Any] = {
+    reranked = rerank_chunks(effective_question, filtered, top_n=5)
+    best_distance = min(c["distance"] for c in reranked)
+    context = "\n\n---\n\n".join(c["text"] for c in reranked)
+    system_prompt, user_prompt = _build_prompt(effective_question, context, is_summary, is_identity)
+
+    citations = [
+        {
+            "page_number": c.get("page_number"),
+            "filename": c.get("filename", ""),
+            "text_snippet": c["text"][:150],
+        }
+        for c in reranked
+    ]
+
+    t_llm = time.perf_counter()
+    try:
+        msgs = [{"role": "system", "content": system_prompt}]
+        msgs += [{"role": m["role"], "content": m["content"]} for m in history[-6:]]
+        msgs.append({"role": "user", "content": user_prompt})
+        completion = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=msgs,
+            temperature=0.0,
+            max_tokens=800 if is_summary else 500,
+        )
+        answer = completion.choices[0].message.content
+        llm_ms = int((time.perf_counter() - t_llm) * 1000)
+    except Exception as e:
+        return {"answer": "Failed to generate response.", "source": "error", "chunks_used": 0, "best_distance": None, "citations": []}
+
+    print(f"Done — chunks:{len(reranked)} retrieval:{retrieval_ms}ms llm:{llm_ms}ms")
+
+    # Persist evaluation metrics asynchronously (doesn't block the response)
+    import threading
+    threading.Thread(
+        target=save_query_evaluation,
+        args=(
+            document_id, user_id, "document", len(reranked),
+            reranked[0]["score"] if reranked else None,
+            retrieval_ms, llm_ms, answer, question,
+            [c["text"] for c in reranked],
+        ),
+        daemon=True,
+    ).start()
+
+    return {
         "answer": answer,
-        "source": source,
-        "chunks_used": len(relevant_chunks),
-        "best_distance": best_distance if relevant_chunks else None,
+        "source": "document",
+        "chunks_used": len(reranked),
+        "best_distance": best_distance,
+        "citations": citations,
+        "retrieval_latency_ms": retrieval_ms,
+        "llm_latency_ms": llm_ms,
     }
 
-    print(f"Query completed - Source: {source}, Chunks: {len(relevant_chunks)}\n")
 
-    return response
+# ── Streaming query ────────────────────────────────────────────────────────────
 
+def query_document_stream(
+    document_id: int,
+    question: str,
+    user_id: int,
+    conversation_history: Optional[List[Dict]] = None,
+) -> Generator[Dict, None, None]:
+    """
+    Yields SSE event dicts:
+      {"event": "citations", "data": [...]}
+      {"event": "token",     "data": str}
+      {"event": "done",      "data": {"source": str, "chunks_used": int}}
+      {"event": "error",     "data": str}
+    """
+    doc_id = str(document_id)
+    history = conversation_history or []
+    effective_question = rewrite_query(question, history)
+
+    try:
+        total_chunks = qdrant_client.count(
+            collection_name=COLLECTION_NAME,
+            count_filter={"must": [{"key": "doc_id", "match": {"value": doc_id}}]},
+        ).count
+        if total_chunks == 0:
+            yield {"event": "error", "data": "Document has no content. Please re-upload it."}
+            return
+    except Exception:
+        yield {"event": "error", "data": "Failed to access document storage."}
+        return
+
+    is_summary, is_identity, n_results, threshold = _classify_question(effective_question, total_chunks)
+
+    try:
+        embedding = generate_embedding(effective_question)
+        candidate_chunks = _search_qdrant_with_query(doc_id, effective_question, embedding, n_results)
+    except Exception:
+        yield {"event": "error", "data": "Search failed."}
+        return
+
+    filtered = _filter_chunks(candidate_chunks, is_summary, is_identity, effective_question, threshold)
+
+    if not filtered:
+        system_prompt = "You are a helpful AI assistant. Acknowledge the information wasn't in the document and provide helpful general knowledge."
+        user_prompt = f"Question: {question}\n\nThis wasn't found in the document. Be helpful."
+        source = "general_knowledge"
+        chunks_used = 0
+    else:
+        reranked = rerank_chunks(effective_question, filtered, top_n=5)
+        citations = [
+            {
+                "page_number": c.get("page_number"),
+                "filename": c.get("filename", ""),
+                "text_snippet": c["text"][:150],
+            }
+            for c in reranked
+        ]
+        yield {"event": "citations", "data": citations}
+        context = "\n\n---\n\n".join(c["text"] for c in reranked)
+        system_prompt, user_prompt = _build_prompt(effective_question, context, is_summary, is_identity)
+        source = "document"
+        chunks_used = len(reranked)
+
+    try:
+        msgs = [{"role": "system", "content": system_prompt}]
+        msgs += [{"role": m["role"], "content": m["content"]} for m in history[-6:]]
+        msgs.append({"role": "user", "content": user_prompt})
+
+        stream = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=msgs,
+            temperature=0.0,
+            max_tokens=800 if is_summary else 500,
+            stream=True,
+        )
+        for chunk in stream:
+            token = chunk.choices[0].delta.content or ""
+            if token:
+                yield {"event": "token", "data": token}
+    except Exception as e:
+        yield {"event": "error", "data": f"LLM error: {e}"}
+        return
+
+    yield {"event": "done", "data": {"source": source, "chunks_used": chunks_used}}
+
+
+# ── Evaluation ─────────────────────────────────────────────────────────────────
+
+def compute_faithfulness(question: str, answer: str, context_chunks: List[str]) -> tuple:
+    """
+    LLM-as-judge faithfulness scoring (non-blocking; call in background thread).
+    Returns (score: float 0-1 | None, label: str).
+    """
+    if not context_chunks:
+        return None, "unknown"
+    context_text = "\n\n---\n\n".join(context_chunks[:3])  # limit context size
+    prompt = f"""Given the context and a question, evaluate if the answer is faithful to the context.
+
+CONTEXT:
+{context_text}
+
+QUESTION: {question}
+
+ANSWER: {answer}
+
+Rate faithfulness 0–1:
+- 1.0: All claims directly supported by context
+- 0.5: Mostly supported with minor additions
+- 0.0: Contains significant information not in context
+
+Respond with ONLY valid JSON: {{"score": <float>, "label": "faithful|hallucinated|unknown"}}"""
+
+    try:
+        import json
+        completion = groq_client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=60,
+        )
+        raw = completion.choices[0].message.content.strip()
+        # Extract JSON even if the model wraps it in markdown
+        if "```" in raw:
+            raw = raw.split("```")[1].lstrip("json").strip()
+        result = json.loads(raw)
+        return float(result.get("score", 0.5)), str(result.get("label", "unknown"))
+    except Exception as e:
+        print(f"Faithfulness scoring failed: {e}")
+        return None, "unknown"
+
+
+def save_query_evaluation(
+    document_id: int,
+    user_id: int,
+    source: str,
+    chunks_retrieved: int,
+    retrieval_score: Optional[float],
+    retrieval_latency_ms: int,
+    llm_latency_ms: int,
+    answer: str,
+    question: str,
+    context_chunks: List[str],
+) -> None:
+    """Persist a QueryEvaluation row. Runs in a background thread — opens its own DB session."""
+    from app.models import QueryEvaluation
+    faithfulness_score, faithfulness_label = compute_faithfulness(question, answer, context_chunks)
+    db = SessionLocal()
+    try:
+        db.add(
+            QueryEvaluation(
+                document_id=document_id,
+                user_id=user_id,
+                source=source,
+                chunks_retrieved=chunks_retrieved,
+                retrieval_score=retrieval_score,
+                faithfulness_score=faithfulness_score,
+                faithfulness_label=faithfulness_label,
+                retrieval_latency_ms=retrieval_latency_ms,
+                llm_latency_ms=llm_latency_ms,
+                total_latency_ms=retrieval_latency_ms + llm_latency_ms,
+            )
+        )
+        db.commit()
+    except Exception as e:
+        print(f"Failed to save query evaluation: {e}")
+        db.rollback()
+    finally:
+        db.close()
+
+
+# ── Migration ──────────────────────────────────────────────────────────────────
+
+def migrate_documents_to_hybrid(db: Session) -> Dict[str, Any]:
+    """
+    Re-index all documents from the legacy dense collection into the hybrid
+    (BM25 + dense) collection. Idempotent — already-indexed chunks are skipped
+    because we check count before processing each document.
+    """
+    documents = get_user_documents_all(db)
+    total = len(documents)
+    migrated = 0
+    skipped = 0
+    failed = 0
+
+    print(f"\nStarting hybrid migration for {total} documents...")
+
+    for doc in documents:
+        doc_id = str(doc.id)
+        doc_filter = {"must": [{"key": "doc_id", "match": {"value": doc_id}}]}
+
+        # Skip if already in hybrid collection
+        try:
+            count_in_v2 = qdrant_client.count(
+                collection_name=HYBRID_COLLECTION,
+                count_filter=doc_filter,
+            ).count
+            if count_in_v2 > 0:
+                skipped += 1
+                continue
+        except Exception:
+            pass
+
+        # Locate the PDF on disk
+        upload_dir = "uploads"
+        file_path = os.path.join(upload_dir, f"user_{doc.user_id}_{doc.filename}")
+        if not os.path.exists(file_path):
+            file_path = os.path.join(upload_dir, doc.filename)
+        if not os.path.exists(file_path):
+            print(f"File not found for document {doc.id}: {doc.filename}")
+            failed += 1
+            continue
+
+        try:
+            _, pages = extract_pages_from_pdf(file_path)
+            chunk_dicts = chunk_document(pages, chunk_size=800, overlap=150)
+            texts = [c["text"] for c in chunk_dicts]
+            embeddings = generate_embeddings_batch(texts)
+
+            hybrid_points = [
+                PointStruct(
+                    id=str(uuid.uuid4()),
+                    vector={
+                        "dense": emb,
+                        "sparse": generate_sparse_vector(c["text"]),
+                    },
+                    payload={
+                        "doc_id": doc_id,
+                        "user_id": str(doc.user_id),
+                        "chunk_index": c["chunk_index"],
+                        "page_number": c.get("page_number"),
+                        "filename": doc.filename,
+                        "text": c["text"],
+                    },
+                )
+                for c, emb in zip(chunk_dicts, embeddings)
+            ]
+            qdrant_client.upsert(collection_name=HYBRID_COLLECTION, points=hybrid_points)
+            migrated += 1
+            print(f"Migrated document {doc.id} ({doc.filename}): {len(hybrid_points)} chunks")
+        except Exception as e:
+            print(f"Failed to migrate document {doc.id}: {e}")
+            failed += 1
+
+    result = {"total": total, "migrated": migrated, "skipped": skipped, "failed": failed}
+    print(f"Migration complete: {result}")
+    return result
+
+
+def get_user_documents_all(db: Session) -> List[Document]:
+    """Return all documents across all users (for migration use only)."""
+    return db.query(Document).all()
+
+
+# ── Delete / list ──────────────────────────────────────────────────────────────
 
 def delete_document(document_id: int, user_id: int, db: Session) -> bool:
-    print(f"\nDeleting document {document_id}")
-
     document = (
         db.query(Document)
         .filter(Document.id == document_id, Document.user_id == user_id)
         .first()
     )
-
     if not document:
-        print(f"Document {document_id} not found or unauthorized")
         return False
 
     try:
-        doc_id = str(document_id)
-
         qdrant_client.delete(
             collection_name=COLLECTION_NAME,
             points_selector={
-                "filter": {"must": [{"key": "doc_id", "match": {"value": doc_id}}]}
+                "filter": {"must": [{"key": "doc_id", "match": {"value": str(document_id)}}]}
             },
         )
-
-        print("Deleted chunks from Qdrant")
-
-        file_path = os.path.join("uploads", f"user_{user_id}_{document.filename}")
-        if os.path.exists(file_path):
-            os.remove(file_path)
-            print(f"Deleted file: {file_path}")
-        else:
-            file_path = os.path.join("uploads", document.filename)
-            if os.path.exists(file_path):
-                os.remove(file_path)
-                print(f"Deleted file: {file_path}")
-
+        for path in [
+            os.path.join("uploads", f"user_{user_id}_{document.filename}"),
+            os.path.join("uploads", document.filename),
+        ]:
+            if os.path.exists(path):
+                os.remove(path)
+                break
     except Exception as e:
-        print(f"Warning: Failed to delete resources: {e}")
+        print(f"Warning: cleanup failed: {e}")
 
     db.delete(document)
     db.commit()
-
-    print(f"Document {document_id} deleted successfully")
     return True
 
 
 def get_user_documents(user_id: int, db: Session) -> List[Document]:
-    documents = (
+    return (
         db.query(Document)
         .filter(Document.user_id == user_id)
         .order_by(Document.upload_date.desc())
         .all()
     )
-
-    return documents

@@ -20,8 +20,10 @@ dependencies = [
     "python-dotenv>=1.2.1",
     "python-jose>=3.5.0",
     "python-multipart>=0.0.21",
-    "qdrant-client>=1.16.2",
+    "cloudinary>=1.40.0",
+    "qdrant-client>=1.18",
     "ruff>=0.14.13",
     "sqlalchemy>=2.0.45",
     "uvicorn>=0.40.0",
+    "fastembed>=0.8.0",
 ]
