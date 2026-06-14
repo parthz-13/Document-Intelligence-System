@@ -4,26 +4,49 @@ import {
   createConversation,
   getConversationMessages,
   getDocuments,
+  getPdfBlob,
   queryDocumentStream,
 } from "../api";
+import {
+  ArrowLeft,
+  Eye,
+  Plus,
+  Send,
+  MessageSquare,
+  ChevronDown,
+  ChevronUp,
+  BookOpen,
+  Calendar,
+  Layers,
+  Sparkles
+} from "lucide-react";
 
 function CitationCard({ citation, index }) {
   const [expanded, setExpanded] = useState(false);
   return (
-    <div className="citation-card">
+    <div className="bg-brand-paper border border-brand-forest/10 rounded-xl overflow-hidden shadow-sm transition-all duration-200">
       <button
-        className="citation-header"
+        type="button"
+        className="w-full flex items-center justify-between px-4 py-3 bg-brand-cream/30 hover:bg-brand-cream/60 transition-colors text-left"
         onClick={() => setExpanded((v) => !v)}
       >
-        <span className="citation-badge">[{index + 1}]</span>
-        <span className="citation-page">
-          {citation.page_number ? `Page ${citation.page_number}` : "Page N/A"}
-          {citation.filename ? ` · ${citation.filename}` : ""}
-        </span>
-        <span className="citation-chevron">{expanded ? "▲" : "▼"}</span>
+        <div className="flex items-center gap-2">
+          <span className="text-xs font-bold text-brand-forest bg-brand-forest/5 border border-brand-forest/15 px-2 py-0.5 rounded-full">
+            Source [{index + 1}]
+          </span>
+          <span className="text-xs font-semibold text-brand-forest/80 truncate max-w-[180px] sm:max-w-xs">
+            {citation.page_number ? `Page ${citation.page_number}` : "Page N/A"}
+            {citation.filename ? ` · ${citation.filename}` : ""}
+          </span>
+        </div>
+        <div className="text-brand-forest/50">
+          {expanded ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+        </div>
       </button>
       {expanded && (
-        <div className="citation-snippet">"{citation.text_snippet}…"</div>
+        <div className="px-4 py-3 border-t border-brand-forest/10 bg-brand-cream/10 text-xs md:text-sm text-brand-forest/90 leading-relaxed font-sans italic">
+          "{citation.text_snippet}…"
+        </div>
       )}
     </div>
   );
@@ -164,101 +187,175 @@ function Chat() {
     startNewConversation(`conv_${documentId}`);
   };
 
+  const handleOpenPdf = async () => {
+    if (!document?.pdf_url) return;
+    try {
+      const blob = await getPdfBlob(document.id);
+      const url = URL.createObjectURL(blob);
+      window.open(url, "_blank");
+    } catch {
+      setError("Failed to open PDF");
+    }
+  };
+
   return (
-    <div className="container chat-container">
-      <div className="chat-header">
-        <button
-          className="btn btn-secondary btn-small"
-          onClick={() => navigate("/home")}
-        >
-          ← Back
-        </button>
-        <div style={{ flex: 1 }}>
-          <h2 style={{ fontSize: "1.25rem", color: "var(--accent)" }}>
-            {document?.filename || "Loading..."}
-          </h2>
-          {document && (
-            <span style={{ fontSize: "0.875rem", color: "var(--text-muted)" }}>
-              {document.page_count} pages · {document.chunk_count} chunks
-            </span>
-          )}
-        </div>
-        <div style={{ display: "flex", gap: "0.5rem", alignItems: "center" }}>
-          {document?.pdf_url && (
-            <a
-              href={document.pdf_url}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="btn btn-secondary btn-small"
+    <div className="min-h-screen bg-brand-bg flex flex-col h-screen">
+      {/* Top Navigation Bar */}
+      <header className="bg-brand-cream border-b border-brand-forest/10 px-6 py-4 shadow-sm z-20 flex-shrink-0">
+        <div className="max-w-5xl mx-auto flex items-center justify-between gap-4">
+          <div className="flex items-center gap-3">
+            <button
+              onClick={() => navigate("/home")}
+              className="p-2 hover:bg-brand-forest/5 rounded-xl border border-brand-forest/10 text-brand-forest transition-colors"
+              title="Back to Documents"
             >
-              View PDF
-            </a>
-          )}
-          <button
-            className="btn btn-secondary btn-small"
-            onClick={handleNewChat}
-            title="Start a new conversation"
-          >
-            New chat
-          </button>
+              <ArrowLeft className="w-4 h-4" />
+            </button>
+            <div className="min-w-0">
+              <h1 className="font-serif text-lg font-bold text-brand-forest truncate leading-tight">
+                {document?.filename || "Loading document..."}
+              </h1>
+              {document && (
+                <div className="flex items-center gap-x-2 gap-y-0.5 text-xs text-[#5c723d] flex-wrap mt-0.5">
+                  <span className="flex items-center gap-1">
+                    <Layers className="w-3 h-3" />
+                    {document.page_count} pages
+                  </span>
+                  <span>•</span>
+                  <span>{document.chunk_count} text chunks index</span>
+                </div>
+              )}
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2">
+            {document?.pdf_url && (
+              <button
+                onClick={handleOpenPdf}
+                className="p-2 hover:bg-brand-forest/5 rounded-xl border border-brand-forest/10 text-brand-forest transition-colors flex items-center gap-1.5 text-xs font-semibold"
+                title="View PDF Source"
+              >
+                <Eye className="w-4 h-4" />
+                <span className="hidden sm:inline">View PDF</span>
+              </button>
+            )}
+            <button
+              onClick={handleNewChat}
+              className="p-2 bg-brand-forest hover:bg-brand-forest-hover text-brand-bg rounded-xl shadow-sm transition-all duration-300 flex items-center gap-1.5 text-xs font-semibold"
+              title="Start a new chat conversation"
+            >
+              <Plus className="w-4 h-4" />
+              <span className="hidden sm:inline">New Chat</span>
+            </button>
+          </div>
         </div>
-      </div>
+      </header>
 
-      {error && <div className="alert alert-error">{error}</div>}
+      {/* Main Conversation Stream */}
+      <main className="flex-1 overflow-y-auto px-6 py-6 scrollbar-none max-w-4xl mx-auto w-full flex flex-col gap-6">
+        {error && (
+          <div className="bg-red-50 border border-red-200 text-red-700 text-sm rounded-xl p-4 flex items-start gap-2 flex-shrink-0 shadow-sm">
+            <span className="font-semibold">Error:</span>
+            <span>{error}</span>
+          </div>
+        )}
 
-      <div className="chat-messages">
         {messages.length === 0 && !loading && (
-          <div className="empty-state">
-            <h3>Ask a question</h3>
-            <p>Start by asking something about this document</p>
+          <div className="my-auto flex flex-col items-center justify-center text-center py-12">
+            <div className="p-4 bg-brand-forest/5 rounded-full border border-brand-forest/10 inline-block mb-4">
+              <MessageSquare className="w-8 h-8 text-brand-forest" />
+            </div>
+            <h2 className="font-serif text-2xl text-brand-forest mb-2">Ask a Question</h2>
+            <p className="text-sm text-brand-forest/60 max-w-sm mx-auto">
+              Type a prompt below to query the text contents of <span className="font-semibold">"{document?.filename}"</span>. 
+              The assistant retrieves context and answers using grounded RAG nodes.
+            </p>
           </div>
         )}
 
         {messages.map((msg, idx) => (
-          <div key={idx} className={`message message-${msg.type}`}>
-            <div style={{ whiteSpace: "pre-wrap" }}>
+          <div
+            key={idx}
+            className={`flex flex-col gap-2 max-w-[85%] ${
+              msg.type === "user" ? "self-end items-end" : "self-start items-start"
+            }`}
+          >
+            {/* Bubble content */}
+            <div
+              className={`px-6 py-4 rounded-2xl text-sm leading-relaxed shadow-sm font-sans whitespace-pre-wrap ${
+                msg.type === "user"
+                  ? "bg-brand-forest text-brand-bg rounded-br-sm"
+                  : "bg-brand-cream border border-brand-forest/10 text-brand-forest rounded-bl-sm"
+              }`}
+            >
               {msg.content}
-              {msg.streaming && <span className="streaming-cursor" />}
+              {msg.streaming && (
+                <span className="inline-block w-1.5 h-4 bg-current ml-1 align-middle animate-cursor-blink" />
+              )}
             </div>
 
-            {msg.type === "ai" && !msg.streaming && msg.source && (
-              <div className="message-source">
-                Source: {msg.source}
-                {msg.chunksUsed > 0 && ` · ${msg.chunksUsed} chunks used`}
-              </div>
-            )}
+            {/* AI message metadata/source/citations */}
+            {msg.type === "ai" && !msg.streaming && (
+              <div className="w-full flex flex-col gap-2 mt-1">
+                {msg.source && (
+                  <div className="flex items-center gap-1.5 text-xs text-brand-forest/60 font-semibold px-1">
+                    <Sparkles className="w-3.5 h-3.5 text-brand-forest/85" />
+                    <span>Mode: {msg.source}</span>
+                    {msg.chunksUsed > 0 && (
+                      <>
+                        <span>•</span>
+                        <span>{msg.chunksUsed} context chunks referenced</span>
+                      </>
+                    )}
+                  </div>
+                )}
 
-            {msg.type === "ai" && msg.citations?.length > 0 && (
-              <div className="citations-container">
-                <div className="citations-label">Sources</div>
-                {msg.citations.map((c, i) => (
-                  <CitationCard key={i} citation={c} index={i} />
-                ))}
+                {msg.citations?.length > 0 && (
+                  <div className="flex flex-col gap-2 mt-1 pl-1">
+                    <div className="text-[10px] font-bold uppercase tracking-wider text-brand-forest/45">
+                      Grounding Context References
+                    </div>
+                    <div className="flex flex-col gap-1.5">
+                      {msg.citations.map((c, i) => (
+                        <CitationCard key={i} citation={c} index={i} />
+                      ))}
+                    </div>
+                  </div>
+                )}
               </div>
             )}
           </div>
         ))}
 
         <div ref={messagesEndRef} />
-      </div>
+      </main>
 
-      <form className="chat-input" onSubmit={handleSubmit}>
-        <input
-          type="text"
-          className="form-input"
-          placeholder="Ask a question about this document..."
-          value={question}
-          onChange={(e) => setQuestion(e.target.value)}
-          disabled={loading}
-        />
-        <button
-          type="submit"
-          className="btn btn-primary"
-          disabled={loading || !question.trim()}
-        >
-          {loading ? "..." : "Send"}
-        </button>
-      </form>
+      {/* Message Input Section */}
+      <footer className="bg-brand-cream border-t border-brand-forest/10 px-6 py-4 flex-shrink-0 z-20">
+        <div className="max-w-4xl mx-auto">
+          <form onSubmit={handleSubmit} className="flex gap-3 relative items-center">
+            <input
+              type="text"
+              className="flex-1 bg-brand-paper border border-brand-forest/10 rounded-xl py-3.5 pl-4 pr-14 text-sm text-brand-forest placeholder-brand-forest/40 focus:outline-none focus:border-brand-forest/30 transition-colors shadow-sm disabled:opacity-75"
+              placeholder="Ask a question about this document..."
+              value={question}
+              onChange={(e) => setQuestion(e.target.value)}
+              disabled={loading}
+            />
+            <button
+              type="submit"
+              disabled={loading || !question.trim()}
+              className="absolute right-2 p-2 bg-brand-forest hover:bg-brand-forest-hover disabled:bg-brand-forest/30 text-brand-bg rounded-lg shadow-sm transition-all duration-300"
+              title="Send Prompt"
+            >
+              <Send className="w-4.5 h-4.5" />
+            </button>
+          </form>
+          <div className="text-[10px] text-center text-brand-forest/45 mt-2">
+            AskYourPDF uses context retrieval to <b>reduce</b> hallucination.
+          </div>
+        </div>
+      </footer>
     </div>
   );
 }
