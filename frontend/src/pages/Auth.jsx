@@ -59,10 +59,7 @@ function Auth() {
         {/* Hero Section */}
         <main className="max-w-4xl mx-auto w-full my-auto flex flex-col items-center text-center py-12">
           {/* Tagline Badge */}
-          <div className="inline-flex items-center gap-2 bg-brand-forest/5 px-4 py-1.5 rounded-full border border-brand-forest/10 text-brand-forest text-xs font-semibold uppercase tracking-wider mb-6 animate-fade-in">
-            <Sparkles className="w-3.5 h-3.5 text-brand-forest" />
-            Document Intelligence Platform
-          </div>
+
 
           <h1 className="text-4xl md:text-6xl lg:text-7xl font-serif text-brand-forest leading-[1.1] tracking-tight max-w-3xl mb-6">
             Ask your PDFs.<br />
